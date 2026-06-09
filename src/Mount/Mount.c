@@ -103,6 +103,7 @@ enum hidden_os_read_only_notif_mode
 #define TIMER_INTERVAL_KEYB_LAYOUT_GUARD	10
 #define TIMER_INTERVAL_UPDATE_DEVICE_LIST	1000
 #define TIMER_INTERVAL_CHECK_FOREGROUND		500
+#define TC_COMMAND_CANCEL_MOUNT				L"/cancelmount"
 
 BootEncryption			*BootEncObj = NULL;
 BootEncryptionStatus	BootEncStatus;
@@ -187,6 +188,282 @@ VOLUME_NOTIFICATIONS_LIST	VolumeNotificationsList;
 static DWORD				LastKnownLogicalDrives;
 
 static volatile LONG FavoriteMountOnGoing = 0;
+static list <FavoriteVolume> SuppressedFavoritesOnArrivalMount;
+
+typedef enum
+{
+	MountResultFailed = 0,
+	MountResultSucceeded,
+	MountResultSkipped,
+	MountResultCancelled,
+	MountResultArrivalPasswordPromptDeclined,
+	/* Preserves legacy favorite-on-arrival behavior: a drive-letter conflict is a
+	   handled skip so the timer does not repeatedly show the same error while the
+	   device remains connected. */
+	MountResultDriveLetterUnavailable
+} MountResult;
+
+typedef struct
+{
+	volatile LONG bAbortRequested;
+	volatile LONG nCurrentMountDriveNo;
+} MountBatchContext;
+
+typedef struct
+{
+	BOOL Success;
+	BOOL MountedAny;
+	/* Reason the batch stopped early. Non-terminal per-favorite failures are
+	   reflected by Success == FALSE while StopReason remains MountResultSucceeded. */
+	MountResult StopReason;
+} MountFavoriteVolumesResult;
+
+typedef struct
+{
+	BOOL systemFavorites;
+	BOOL logOnMount;
+	BOOL hotKeyMount;
+	MountBatchContext mountBatch;
+	/* Owned by the thread parameter when non-NULL. */
+	FavoriteVolume* favoriteVolumeToMount;
+} mountFavoriteVolumeThreadParam;
+
+static void __cdecl mountFavoriteVolumeThreadFunction (void *pArg);
+static MountFavoriteVolumesResult MountFavoriteVolumesWithAbort (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOOL hotKeyMount, const FavoriteVolume &favoriteVolumeToMount, MountBatchContext* pMountBatch);
+
+
+static void MountBatchInitialize (MountBatchContext* pMountBatch)
+{
+	if (pMountBatch)
+	{
+		InterlockedExchange (&pMountBatch->bAbortRequested, FALSE);
+		InterlockedExchange (&pMountBatch->nCurrentMountDriveNo, -1);
+	}
+}
+
+
+static void MountBatchSetCurrentMountDriveNo (MountBatchContext* pMountBatch, int nDosDriveNo)
+{
+	if (pMountBatch)
+		InterlockedExchange (&pMountBatch->nCurrentMountDriveNo, nDosDriveNo);
+}
+
+
+static void MountBatchClearCurrentMountDriveNo (MountBatchContext* pMountBatch)
+{
+	MountBatchSetCurrentMountDriveNo (pMountBatch, -1);
+}
+
+
+static BOOL MountBatchAbortRequested (MountBatchContext* pMountBatch)
+{
+	return pMountBatch && InterlockedCompareExchange (&pMountBatch->bAbortRequested, 0, 0) != 0;
+}
+
+
+static void MountBatchRequestAbort (MountBatchContext* pMountBatch)
+{
+	if (pMountBatch)
+		InterlockedExchange (&pMountBatch->bAbortRequested, TRUE);
+}
+
+
+static BOOL MountBatchAbortCurrentMountOperation (MountBatchContext* pMountBatch)
+{
+	LONG nDosDriveNo;
+
+	if (!pMountBatch)
+		return FALSE;
+
+	nDosDriveNo = InterlockedCompareExchange (&pMountBatch->nCurrentMountDriveNo, 0, 0);
+
+	/* No mount is registered yet. The abort flag has already been set by the caller,
+	   and MountVolumeWithBatchCancel re-checks that flag after publishing the drive
+	   number, so the worker is guaranteed to honor it before launching the (possibly
+	   long) KDF. Reporting the cancel as handled is therefore safe. */
+	if (nDosDriveNo < 0)
+		return TRUE;
+
+	return AbortMountOperation ((int) nDosDriveNo);
+}
+
+
+/* Shared wait-dialog cancel handler for batch mount operations: requests the batch abort
+   and tries to abort the mount currently in flight. Returns TRUE if the cancel has been
+   fully handled (so the wait dialog can stop retrying). */
+static BOOL MountBatchCancel (MountBatchContext* pMountBatch)
+{
+	MountBatchRequestAbort (pMountBatch);
+	return MountBatchAbortCurrentMountOperation (pMountBatch);
+}
+
+
+/* Returns TRUE if a MountVolume()/MountVolumeWithBatchCancel() result indicates the
+   operation was aborted (either cooperatively through the batch abort flag or through
+   the driver, e.g. an external /cancelmount). Must be called immediately after the
+   mount call, before any other Win32 call clobbers the thread's last-error value. */
+static BOOL MountVolumeWasCancelled (int mountResult)
+{
+	return (mountResult < 0) && (GetLastError () == ERROR_CANCELLED);
+}
+
+
+static int MountVolumeWithBatchCancel (
+	HWND hwndDlg,
+	int nDosDriveNo,
+	wchar_t *szVolFileName,
+	Password *password,
+	int pkcs5,
+	int pim,
+	BOOL cachePassword,
+	BOOL cachePim,
+	BOOL sharedAccess,
+	const MountOptions* const mountOptionsParam,
+	BOOL quiet,
+	BOOL bReportWrongPassword,
+	MountBatchContext* pMountBatch)
+{
+	int mounted;
+
+	if (MountBatchAbortRequested (pMountBatch))
+	{
+		SetLastError (ERROR_CANCELLED);
+		return -1;
+	}
+
+	MountBatchSetCurrentMountDriveNo (pMountBatch, nDosDriveNo);
+
+	/* Close the cancel race: the cancel callback sets the abort flag before reading the
+	   current drive number, while we publish the drive number before re-reading the flag.
+	   This Dekker-style handshake (both sides use full-barrier Interlocked ops) guarantees
+	   that either the cancel callback sees our drive number and aborts the driver, or we
+	   see the abort flag here and bail out before starting the long mount. */
+	if (MountBatchAbortRequested (pMountBatch))
+	{
+		MountBatchClearCurrentMountDriveNo (pMountBatch);
+		SetLastError (ERROR_CANCELLED);
+		return -1;
+	}
+
+	SetLastError (ERROR_SUCCESS);
+	mounted = MountVolume (hwndDlg, nDosDriveNo, szVolFileName, password, pkcs5, pim, cachePassword, cachePim, sharedAccess, mountOptionsParam, quiet, bReportWrongPassword);
+
+	MountBatchClearCurrentMountDriveNo (pMountBatch);
+	return mounted;
+}
+
+
+static bool FavoriteVolumesMatchForArrivalCancel (const FavoriteVolume& left, const FavoriteVolume& right)
+{
+	if (left.UseVolumeID && right.UseVolumeID
+		&& !IsRepeatedByteArray (0, left.VolumeID, sizeof (left.VolumeID))
+		&& !IsRepeatedByteArray (0, right.VolumeID, sizeof (right.VolumeID)))
+	{
+		return memcmp (left.VolumeID, right.VolumeID, VOLUME_ID_SIZE) == 0;
+	}
+
+	if (!left.VolumePathId.empty() && !right.VolumePathId.empty())
+		return _wcsicmp (left.VolumePathId.c_str(), right.VolumePathId.c_str()) == 0;
+
+	if (!left.Path.empty() && !right.Path.empty())
+		return _wcsicmp (left.Path.c_str(), right.Path.c_str()) == 0;
+
+	return false;
+}
+
+
+static bool FavoriteVolumeArrivalMountSuppressed (const list <FavoriteVolume>& suppressedFavorites, const FavoriteVolume& favorite)
+{
+	for (const FavoriteVolume& suppressedFavorite: suppressedFavorites)
+	{
+		if (FavoriteVolumesMatchForArrivalCancel (suppressedFavorite, favorite))
+			return true;
+	}
+
+	return false;
+}
+
+
+static void SuppressFavoriteVolumeArrivalMount (list <FavoriteVolume>& suppressedFavorites, const FavoriteVolume& favorite)
+{
+	if (!FavoriteVolumeArrivalMountSuppressed (suppressedFavorites, favorite))
+		suppressedFavorites.push_back (favorite);
+}
+
+
+static void ResumeFavoriteVolumeArrivalMount (list <FavoriteVolume>& suppressedFavorites, const FavoriteVolume& favorite)
+{
+	for (list <FavoriteVolume>::iterator suppressedFavorite = suppressedFavorites.begin();
+		suppressedFavorite != suppressedFavorites.end();)
+	{
+		if (FavoriteVolumesMatchForArrivalCancel (*suppressedFavorite, favorite))
+			suppressedFavorite = suppressedFavorites.erase (suppressedFavorite);
+		else
+			++suppressedFavorite;
+	}
+}
+
+
+void ClearFavoriteVolumeArrivalMountSuppressions ()
+{
+	SuppressedFavoritesOnArrivalMount.clear ();
+}
+
+
+/* Determines whether a "mount on arrival" favorite currently refers to a present,
+   not-yet-mounted volume, normalizing favorite.Path/VolumePathId/DisconnectedDevice
+   along the way (the favorite is taken by reference). Returns FALSE when the favorite
+   is already mounted or its device is not present; in that case the caller clears any
+   arrival-mount suppression and skips it this round. */
+static BOOL FavoriteVolumeArrivalMountCandidate (FavoriteVolume& favorite)
+{
+	if (favorite.UseVolumeID)
+	{
+		if (IsMountedVolumeID (favorite.VolumeID))
+			return FALSE;
+
+		std::wstring volDevPath = FindDeviceByVolumeID (favorite.VolumeID, FALSE);
+		if (volDevPath.length() == 0)
+			return FALSE;
+
+		favorite.Path = volDevPath;
+		favorite.DisconnectedDevice = false;
+	}
+	else if (!favorite.VolumePathId.empty())
+	{
+		if (IsMountedVolume (favorite.Path.c_str()))
+			return FALSE;
+
+		wchar_t volDevPath[TC_MAX_PATH];
+		if (QueryDosDevice (favorite.VolumePathId.substr (4, favorite.VolumePathId.size() - 5).c_str(), volDevPath, TC_MAX_PATH) == 0)
+			return FALSE;
+
+		favorite.DisconnectedDevice = false;
+	}
+	else if (favorite.Path.find (L"\\\\?\\Volume{") == 0)
+	{
+		wstring resolvedPath = VolumeGuidPathToDevicePath (favorite.Path);
+		if (resolvedPath.empty())
+			return FALSE;
+
+		favorite.DisconnectedDevice = false;
+		favorite.VolumePathId = favorite.Path;
+		favorite.Path = resolvedPath;
+	}
+
+	if (IsMountedVolume (favorite.Path.c_str()))
+		return FALSE;
+
+	if (!IsVolumeDeviceHosted (favorite.Path.c_str()))
+	{
+		if (!FileExists (favorite.Path.c_str()))
+			return FALSE;
+	}
+	else if (favorite.VolumePathId.empty())
+		return FALSE;
+
+	return TRUE;
+}
 
 
 static mountFavoriteVolumeThreadParam* AllocateMountFavoriteVolumeThreadParam (BOOL systemFavorites, BOOL logOnMount, BOOL hotKeyMount, const FavoriteVolume* favoriteVolumeToMount)
@@ -198,6 +475,7 @@ static mountFavoriteVolumeThreadParam* AllocateMountFavoriteVolumeThreadParam (B
 	pParam->systemFavorites = systemFavorites;
 	pParam->logOnMount = logOnMount;
 	pParam->hotKeyMount = hotKeyMount;
+	MountBatchInitialize (&pParam->mountBatch);
 
 	if (favoriteVolumeToMount)
 	{
@@ -5402,9 +5680,10 @@ static int AskVolumePassword (HWND hwndDlg, Password *password, int *pkcs5, int 
 
 // GUI actions
 
-static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pim, int pkcs5)
+static MountResult Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pim, int pkcs5, MountBatchContext* pMountBatch)
 {
-	BOOL status = FALSE;
+	BOOL bMountCancelled = FALSE;
+	MountResult result = MountResultFailed;
 	wchar_t fileName[MAX_PATH];
 	int mounted = 0, EffectiveVolumePkcs5 = 0;
 	int EffectiveVolumePim = (pim < 0)? CmdVolumePim : pim;
@@ -5443,13 +5722,11 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 
 	if (wcslen(fileName) == 0)
 	{
-		status = FALSE;
 		goto ret;
 	}
 
 	if (!TranslateVolumeID (hwndDlg, fileName, ARRAYSIZE (fileName)))
 	{
-		status = FALSE;
 		goto ret;
 	}
 
@@ -5458,7 +5735,6 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 	if (IsMountedVolume (szVolFileName))
 	{
 		Warning ("VOL_ALREADY_MOUNTED", hwndDlg);
-		status = FALSE;
 		goto ret;
 	}
 
@@ -5467,7 +5743,6 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 		if (!MultipleMountOperationInProgress)
 			handleWin32Error (hwndDlg, SRC_POS);
 
-		status = FALSE;
 		goto ret;
 	}
 
@@ -5478,31 +5753,37 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 	if (!bUseCmdVolumePassword)
 	{
 		// First try cached passwords and if they fail ask user for a new one
-		mounted = MountVolume (hwndDlg, nDosDriveNo, szVolFileName, NULL, EffectiveVolumePkcs5, EffectiveVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE);
+		mounted = MountVolumeWithBatchCancel (hwndDlg, nDosDriveNo, szVolFileName, NULL, EffectiveVolumePkcs5, EffectiveVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE, pMountBatch);
+		if (MountVolumeWasCancelled (mounted))
+			bMountCancelled = TRUE;
 
 		// If keyfiles are enabled, test empty password first
-		if (!mounted && KeyFilesEnable && FirstKeyFile && bEffectiveTryEmptyPasswordWhenKeyfileUsed)
+		if (!bMountCancelled && !mounted && KeyFilesEnable && FirstKeyFile && bEffectiveTryEmptyPasswordWhenKeyfileUsed)
 		{
 			Password emptyPassword = {0};
 
 			KeyFilesApply (hwndDlg, &emptyPassword, FirstKeyFile, szVolFileName);
 
-			mounted = MountVolume (hwndDlg, nDosDriveNo, szVolFileName, &emptyPassword, EffectiveVolumePkcs5, EffectiveVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE);
+			mounted = MountVolumeWithBatchCancel (hwndDlg, nDosDriveNo, szVolFileName, &emptyPassword, EffectiveVolumePkcs5, EffectiveVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE, pMountBatch);
+			if (MountVolumeWasCancelled (mounted))
+				bMountCancelled = TRUE;
 
 			burn (&emptyPassword, sizeof (emptyPassword));
 		}
 	}
 
 	// Test password and/or keyfiles used for the previous volume
-	if (!mounted && bEffectiveCacheDuringMultipleMount && MultipleMountOperationInProgress && VolumePassword.Length != 0)
+	if (!bMountCancelled && !mounted && bEffectiveCacheDuringMultipleMount && MultipleMountOperationInProgress && VolumePassword.Length != 0)
 	{
 		// if no PIM specified for favorite, we use also the PIM of the previous volume alongside its password.
-		mounted = MountVolume (hwndDlg, nDosDriveNo, szVolFileName, &VolumePassword, EffectiveVolumePkcs5, (EffectiveVolumePim < 0)? VolumePim : EffectiveVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE);
+		mounted = MountVolumeWithBatchCancel (hwndDlg, nDosDriveNo, szVolFileName, &VolumePassword, EffectiveVolumePkcs5, (EffectiveVolumePim < 0)? VolumePim : EffectiveVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE, pMountBatch);
+		if (MountVolumeWasCancelled (mounted))
+			bMountCancelled = TRUE;
 	}
 
 	NormalCursor ();
 
-	if (mounted)
+	if (mounted > 0)
 	{
 
 		// Check for problematic file extensions (exe, dll, sys)
@@ -5512,6 +5793,12 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 
 	while (mounted == 0)
 	{
+		if (MountBatchAbortRequested (pMountBatch))
+		{
+			bMountCancelled = TRUE;
+			goto ret;
+		}
+
 		if (bUseCmdVolumePassword)
 		{
 			VolumePassword = CmdVolumePassword;
@@ -5525,7 +5812,11 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 			StringCbCopyW (PasswordDlgVolume, sizeof(PasswordDlgVolume), szVolFileName);
 
 			if (!AskVolumePassword (hwndDlg, &VolumePassword, &GuiPkcs5, &GuiPim, NULL, TRUE))
+			{
+				if (FavoriteMountOnArrivalInProgress)
+					result = MountResultArrivalPasswordPromptDeclined;
 				goto ret;
+			}
 			else
 			{
 				VolumePkcs5 = GuiPkcs5;
@@ -5540,7 +5831,9 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 		if (KeyFilesEnable)
 			KeyFilesApply (hwndDlg, &VolumePassword, FirstKeyFile, szVolFileName);
 
-		mounted = MountVolume (hwndDlg, nDosDriveNo, szVolFileName, &VolumePassword, VolumePkcs5, VolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, !Silent);
+		mounted = MountVolumeWithBatchCancel (hwndDlg, nDosDriveNo, szVolFileName, &VolumePassword, VolumePkcs5, VolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, !Silent, pMountBatch);
+		if (MountVolumeWasCancelled (mounted))
+			bMountCancelled = TRUE;
 		NormalCursor ();
 
 		// Check for problematic file extensions (exe, dll, sys)
@@ -5563,7 +5856,7 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szVolFileName, int pi
 
 	if (mounted > 0)
 	{
-		status = TRUE;
+		result = MountResultSucceeded;
 
 		if (bBeep)
 			MessageBeep (0xFFFFFFFF);
@@ -5599,10 +5892,16 @@ ret:
 	if (UsePreferences)
 		bCacheInDriver = bCacheInDriverDefault;
 
-	if (status && CloseSecurityTokenSessionsAfterMount && !MultipleMountOperationInProgress)
+	if (result == MountResultSucceeded && CloseSecurityTokenSessionsAfterMount && !MultipleMountOperationInProgress)
 		SecurityToken::CloseAllSessions(); // TODO Use Token
 
-	return status;
+	if (bMountCancelled)
+	{
+		result = MountResultCancelled;
+		SetLastError (ERROR_CANCELLED);
+	}
+
+	return result;
 }
 
 
@@ -5648,7 +5947,7 @@ void __cdecl mountThreadFunction (void *hwndDlgArg)
 	EnableWindow(hwndDlg, FALSE);
 	finally_do_arg2 (HWND, hwndDlg, BOOL, bIsForeground, { EnableWindow(finally_arg, TRUE);  if (finally_arg2) BringToForeground (finally_arg); bPrebootPasswordDlgMode = FALSE;});
 
-	Mount (hwndDlg, -1, 0, -1, -1);
+	Mount (hwndDlg, -1, 0, -1, -1, NULL);
 }
 
 typedef struct
@@ -5870,11 +6169,21 @@ retry:
 	return status;
 }
 
-static BOOL MountAllDevicesThreadCode (HWND hwndDlg, BOOL bPasswordPrompt)
+typedef struct
 {
+	BOOL bPasswordPrompt;
+	BOOL bRet;
+	MountBatchContext mountBatch;
+} MountAllDevicesThreadParam;
+
+static BOOL MountAllDevicesThreadCode (HWND hwndDlg, MountAllDevicesThreadParam* threadParam)
+{
+	BOOL bPasswordPrompt = threadParam->bPasswordPrompt;
+	MountBatchContext* pMountBatch = &threadParam->mountBatch;
 	HWND driveList = GetDlgItem (MainDlg, IDC_DRIVELIST);
 	int selDrive = ListView_GetSelectionMark (driveList);
 	BOOL shared = FALSE, status = FALSE, bHeaderBakRetry = FALSE;
+	BOOL bCancelled = FALSE;
 	int mountedVolCount = 0;
 	vector <HostDevice> devices;
 	int EffectiveVolumePkcs5 = CmdVolumePkcs5;
@@ -5900,6 +6209,9 @@ static BOOL MountAllDevicesThreadCode (HWND hwndDlg, BOOL bPasswordPrompt)
 
 	do
 	{
+		if (MountBatchAbortRequested (pMountBatch))
+			goto post_mount;
+
 		if (!bHeaderBakRetry)
 		{
 			if (!CmdVolumePasswordValid && bPasswordPrompt)
@@ -5936,13 +6248,22 @@ static BOOL MountAllDevicesThreadCode (HWND hwndDlg, BOOL bPasswordPrompt)
 
 		if (devices.empty())
 			devices = GetAvailableHostDevices (true, false, true, true);
+		if (MountBatchAbortRequested (pMountBatch))
+			goto post_mount;
+
 		for (const HostDevice& drive: devices)
 		{
+			if (MountBatchAbortRequested (pMountBatch))
+				goto post_mount;
+
 			vector <HostDevice> partitions = drive.Partitions;
 			partitions.insert (partitions.begin(), drive);
 
 			for (const HostDevice &device: partitions)
 			{
+				if (MountBatchAbortRequested (pMountBatch))
+					goto post_mount;
+
 				wchar_t szPartPath[TC_MAX_PATH];
 				StringCbCopyW (szPartPath, sizeof (szPartPath), device.Path.c_str());
 				BOOL mounted = IsMountedVolume (szPartPath);
@@ -6005,8 +6326,27 @@ static BOOL MountAllDevicesThreadCode (HWND hwndDlg, BOOL bPasswordPrompt)
 					}
 
 					// First try user password then cached passwords
-					if ((mounted = MountVolume (hwndDlg, nDosDriveNo, szPartPath, &VolumePassword, VolumePkcs5, VolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, TRUE, FALSE)) > 0
-						|| ((VolumePassword.Length > 0) && ((mounted = MountVolume (hwndDlg, nDosDriveNo, szPartPath, NULL, VolumePkcs5, VolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, TRUE, FALSE)) > 0)))
+					mounted = MountVolumeWithBatchCancel (hwndDlg, nDosDriveNo, szPartPath, &VolumePassword, VolumePkcs5, VolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, TRUE, FALSE, pMountBatch);
+					if (MountVolumeWasCancelled (mounted))
+					{
+						MountBatchRequestAbort (pMountBatch);
+						goto post_mount;
+					}
+
+					if (mounted <= 0 && VolumePassword.Length > 0)
+					{
+						if (MountBatchAbortRequested (pMountBatch))
+							goto post_mount;
+
+						mounted = MountVolumeWithBatchCancel (hwndDlg, nDosDriveNo, szPartPath, NULL, VolumePkcs5, VolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, TRUE, FALSE, pMountBatch);
+						if (MountVolumeWasCancelled (mounted))
+						{
+							MountBatchRequestAbort (pMountBatch);
+							goto post_mount;
+						}
+					}
+
+					if (mounted > 0)
 					{
 						// A volume has been successfully mounted
 
@@ -6039,6 +6379,9 @@ static BOOL MountAllDevicesThreadCode (HWND hwndDlg, BOOL bPasswordPrompt)
 				}
 			}
 		}
+
+		if (MountBatchAbortRequested (pMountBatch))
+			goto post_mount;
 
 		if (mountedVolCount < 1)
 		{
@@ -6092,7 +6435,10 @@ static BOOL MountAllDevicesThreadCode (HWND hwndDlg, BOOL bPasswordPrompt)
 
 	} while (bPasswordPrompt && mountedVolCount < 1);
 
-	/* One or more volumes successfully mounted */
+post_mount:
+	/* Finalize any successfully mounted volumes before restoring shared state. */
+
+	bCancelled = MountBatchAbortRequested (pMountBatch);
 
 	ResetWrongPwdRetryCount ();
 
@@ -6130,21 +6476,27 @@ ret:
 
 	NormalCursor();
 
+	if (bCancelled || MountBatchAbortRequested (pMountBatch))
+	{
+		status = FALSE;
+		SetLastError (ERROR_CANCELLED);
+	}
+
 	return status;
 }
-
-typedef struct
-{
-	BOOL bPasswordPrompt;
-	BOOL bRet;
-} MountAllDevicesThreadParam;
 
 void CALLBACK mountAllDevicesThreadProc(void* pArg, HWND hwndDlg)
 {
 	MountAllDevicesThreadParam* threadParam =(MountAllDevicesThreadParam*) pArg;
-	BOOL bPasswordPrompt = threadParam->bPasswordPrompt;
 
-	threadParam->bRet = MountAllDevicesThreadCode (hwndDlg, bPasswordPrompt);
+	threadParam->bRet = MountAllDevicesThreadCode (hwndDlg, threadParam);
+}
+
+BOOL CALLBACK mountAllDevicesCancelProc(void* pArg, HWND )
+{
+	MountAllDevicesThreadParam* threadParam = (MountAllDevicesThreadParam*) pArg;
+
+	return MountBatchCancel (threadParam ? &threadParam->mountBatch : NULL);
 }
 
 static BOOL MountAllDevices (HWND hwndDlg, BOOL bPasswordPrompt)
@@ -6152,11 +6504,18 @@ static BOOL MountAllDevices (HWND hwndDlg, BOOL bPasswordPrompt)
 	MountAllDevicesThreadParam param;
 	param.bPasswordPrompt = bPasswordPrompt;
 	param.bRet = FALSE;
+	MountBatchInitialize (&param.mountBatch);
 
 	if (Silent)
 		mountAllDevicesThreadProc (&param, hwndDlg);
 	else
-		ShowWaitDialog (hwndDlg, FALSE, mountAllDevicesThreadProc, &param);
+		ShowWaitDialogEx (hwndDlg, FALSE, mountAllDevicesThreadProc, mountAllDevicesCancelProc, &param);
+
+	if (MountBatchAbortRequested (&param.mountBatch))
+	{
+		param.bRet = FALSE;
+		SetLastError (ERROR_CANCELLED);
+	}
 
 	return param.bRet;
 }
@@ -7535,6 +7894,8 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 			// Automount
 			if (bAuto || (Quit && szFileName[0] != 0))
 			{
+				BOOL autoMountCancelled = FALSE;
+
 				// No drive letter specified on command line
 				if (commandLineDrive == 0)
 					szDriveLetter[0] = (wchar_t) GetFirstAvailableDrive () + L'A';
@@ -7549,11 +7910,17 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 						KeyFileCloneAll (FirstCmdKeyFile, &defaultKeyFilesParam.FirstKeyFile);
 					}
 
+					SetLastError (ERROR_SUCCESS);
 					if (!MountAllDevices (hwndDlg, !Silent && !CmdVolumePasswordValid && IsPasswordCacheEmpty()))
+					{
+						if (GetLastError () == ERROR_CANCELLED)
+							autoMountCancelled = TRUE;
+
 						exitCode = 1;
+					}
 				}
 
-				if (bAutoMountFavorites)
+				if (!autoMountCancelled && bAutoMountFavorites)
 				{
 					defaultMountOptions = mountOptions;
 					if (FirstCmdKeyFile)
@@ -7563,15 +7930,21 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 						KeyFileCloneAll (FirstCmdKeyFile, &defaultKeyFilesParam.FirstKeyFile);
 					}
 
+					SetLastError (ERROR_SUCCESS);
 					if (!MountFavoriteVolumes (hwndDlg, FALSE, LogOn))
+					{
+						if (GetLastError () == ERROR_CANCELLED)
+							autoMountCancelled = TRUE;
+
 						exitCode = 1;
+					}
 				}
 
-				if (szFileName[0] != 0 && !TranslateVolumeID (hwndDlg, szFileName, ARRAYSIZE (szFileName)))
+				if (!autoMountCancelled && szFileName[0] != 0 && !TranslateVolumeID (hwndDlg, szFileName, ARRAYSIZE (szFileName)))
 				{
 					exitCode = 1;
 				}
-				else if (szFileName[0] != 0 && !IsMountedVolume (szFileName))
+				else if (!autoMountCancelled && szFileName[0] != 0 && !IsMountedVolume (szFileName))
 				{
 					BOOL mounted = FALSE;
 					int EffectiveVolumePkcs5 = CmdVolumePkcs5;
@@ -7597,6 +7970,7 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 							if (FirstCmdKeyFile)
 								KeyFilesApply (hwndDlg, &CmdVolumePassword, FirstCmdKeyFile, szFileName);
 
+							SetLastError (ERROR_SUCCESS);
 							mounted = MountVolume (hwndDlg, szDriveLetter[0] - L'A',
 								szFileName, &CmdVolumePassword, EffectiveVolumePkcs5, CmdVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount,
 								&mountOptions, Silent, reportBadPasswd);
@@ -7606,6 +7980,7 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 						else
 						{
 							// Cached password
+							SetLastError (ERROR_SUCCESS);
 							mounted = MountVolume (hwndDlg, szDriveLetter[0] - L'A', szFileName, NULL, EffectiveVolumePkcs5, CmdVolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE);
 						}
 
@@ -7639,6 +8014,7 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 							if (KeyFilesEnable && FirstKeyFile)
 								KeyFilesApply (hwndDlg, &VolumePassword, FirstKeyFile, szFileName);
 
+							SetLastError (ERROR_SUCCESS);
 							mounted = MountVolume (hwndDlg, szDriveLetter[0] - L'A', szFileName, &VolumePassword, VolumePkcs5, VolumePim, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, FALSE, TRUE);
 
 							burn (&VolumePassword, sizeof (VolumePassword));
@@ -7675,11 +8051,16 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 						}
 					}
 					else
+					{
+						if (GetLastError () == ERROR_CANCELLED)
+							autoMountCancelled = TRUE;
+
 						exitCode = 1;
+					}
 				}
-				else if (bExplore && GetMountedVolumeDriveNo (szFileName) != -1)
+				else if (!autoMountCancelled && bExplore && GetMountedVolumeDriveNo (szFileName) != -1)
 					OpenVolumeExplorerWindow (GetMountedVolumeDriveNo (szFileName));
-				else if (szFileName[0] != 0 && IsMountedVolume (szFileName))
+				else if (!autoMountCancelled && szFileName[0] != 0 && IsMountedVolume (szFileName))
 					Warning ("VOL_ALREADY_MOUNTED", hwndDlg);
 
 				if (!Quit)
@@ -8060,51 +8441,13 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 
 						for (FavoriteVolume& favorite: FavoritesOnArrivalMountRequired)
 						{
-							if (favorite.UseVolumeID)
+							if (!FavoriteVolumeArrivalMountCandidate (favorite))
 							{
-								if (IsMountedVolumeID (favorite.VolumeID))
-									continue;
-
-								std::wstring volDevPath = FindDeviceByVolumeID (favorite.VolumeID, FALSE);
-								if (volDevPath.length() > 0)
-								{
-									favorite.Path = volDevPath;
-									favorite.DisconnectedDevice = false;
-								}
-								else
-									continue;
-							}
-							else if (!favorite.VolumePathId.empty())
-							{
-								if (IsMountedVolume (favorite.Path.c_str()))
-									continue;
-
-								wchar_t volDevPath[TC_MAX_PATH];
-								if (QueryDosDevice (favorite.VolumePathId.substr (4, favorite.VolumePathId.size() - 5).c_str(), volDevPath, TC_MAX_PATH) == 0)
-									continue;
-
-								favorite.DisconnectedDevice = false;
-							}
-							else if (favorite.Path.find (L"\\\\?\\Volume{") == 0)
-							{
-								wstring resolvedPath = VolumeGuidPathToDevicePath (favorite.Path);
-								if (resolvedPath.empty())
-									continue;
-
-								favorite.DisconnectedDevice = false;
-								favorite.VolumePathId = favorite.Path;
-								favorite.Path = resolvedPath;
-							}
-
-							if (IsMountedVolume (favorite.Path.c_str()))
+								ResumeFavoriteVolumeArrivalMount (SuppressedFavoritesOnArrivalMount, favorite);
 								continue;
-
-							if (!IsVolumeDeviceHosted (favorite.Path.c_str()))
-							{
-								if (!FileExists (favorite.Path.c_str()))
-									continue;
 							}
-							else if (favorite.VolumePathId.empty())
+
+							if (FavoriteVolumeArrivalMountSuppressed (SuppressedFavoritesOnArrivalMount, favorite))
 								continue;
 
 							bool mountedAndNotDisconnected = false;
@@ -8119,15 +8462,26 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 
 							if (!mountedAndNotDisconnected)
 							{
-								BOOL mounted = FALSE;
+								MountFavoriteVolumesResult favoriteMountResult;
+								MountBatchContext mountBatch;
+								MountBatchInitialize (&mountBatch);
 								{
 									FavoriteMountOnArrivalInProgress = TRUE;
 									finally_do ({ FavoriteMountOnArrivalInProgress = FALSE; });
-									mounted = MountFavoriteVolumes (hwndDlg, FALSE, FALSE, FALSE, favorite);
+									SetLastError (ERROR_SUCCESS);
+									favoriteMountResult = MountFavoriteVolumesWithAbort (hwndDlg, FALSE, FALSE, FALSE, favorite, &mountBatch);
 								}
 
-								if (mounted)
+								if (favoriteMountResult.Success)
+								{
+									ResumeFavoriteVolumeArrivalMount (SuppressedFavoritesOnArrivalMount, favorite);
 									FavoritesMountedOnArrivalStillConnected.push_back (favorite);
+								}
+								else if (favoriteMountResult.StopReason == MountResultCancelled || favoriteMountResult.StopReason == MountResultArrivalPasswordPromptDeclined)
+								{
+									SuppressFavoriteVolumeArrivalMount (SuppressedFavoritesOnArrivalMount, favorite);
+									break;
+								}
 							}
 						}
 
@@ -9322,8 +9676,13 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 		{
 			if (0 == _InterlockedCompareExchange(&FavoriteMountOnGoing, 1, 0))
 			{
-				if (_beginthread(mountFavoriteVolumeThreadFunction, 0, NULL) == (uintptr_t) -1L)
+				mountFavoriteVolumeThreadParam* pParam = AllocateMountFavoriteVolumeThreadParam (FALSE, FALSE, FALSE, NULL);
+
+				if (!pParam || _beginthread(mountFavoriteVolumeThreadFunction, 0, pParam) == (uintptr_t) -1L)
+				{
+					FreeMountFavoriteVolumeThreadParam (pParam);
 					_InterlockedExchange(&FavoriteMountOnGoing, 0);
+				}
 			}
 			return 1;
 		}
@@ -9558,6 +9917,7 @@ void ExtractCommandLine (HWND hwndDlg, wchar_t *lpszCommandLine)
 				OptionEnableMemoryProtection,
 				OptionEnableScreenProtection,
 				OptionSignalExit,
+				CommandCancelMount,
 				CommandUnmount,
 			};
 
@@ -9591,6 +9951,8 @@ void ExtractCommandLine (HWND hwndDlg, wchar_t *lpszCommandLine)
 				{ OptionEnableMemoryProtection,			L"/protectMemory",	NULL, FALSE },
 				{ OptionEnableScreenProtection,			L"/protectScreen",	NULL, FALSE },
 				{ OptionSignalExit,			L"/signalExit",	NULL, FALSE },
+				// Add /cancelmount to the command table so it appears in /help.
+				{ CommandCancelMount,			TC_COMMAND_CANCEL_MOUNT,	NULL, FALSE },
 				{ CommandUnmount,				L"/unmount",		L"/u", FALSE },
 			};
 
@@ -10588,6 +10950,12 @@ int WINAPI wWinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t *lpsz
 
 	for (int i = 0; argv && i < argc; i++)
 	{
+		if (_wcsicmp (argv[i], TC_COMMAND_CANCEL_MOUNT) == 0)
+		{
+			BOOL abortSent = AbortMountOperation (-1);
+			LocalFree (argv); // free memory allocated by CommandLineToArgvW
+			return abortSent ? 0 : 1;
+		}
 		if (_wcsicmp (argv[i], L"/protectScreen") == 0)
 		{
 			if ((i < argc - 1) && _wcsicmp (argv[i + 1], L"no") == 0)
@@ -10867,9 +11235,9 @@ void DismountIdleVolumes ()
 	}
 }
 
-static BOOL MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, BOOL& lastbExplore, BOOL& userForcedReadOnly, BOOL systemFavorites, BOOL logOnMount, BOOL hotKeyMount, const FavoriteVolume &favoriteVolumeToMount)
+static MountResult MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, BOOL& lastbExplore, BOOL& userForcedReadOnly, BOOL systemFavorites, BOOL logOnMount, BOOL hotKeyMount, const FavoriteVolume &favoriteVolumeToMount, MountBatchContext* pMountBatch)
 {
-	BOOL status = TRUE;
+	MountResult result = MountResultSkipped;
 	int drive;
 	std::wstring effectiveVolumePath;
 	drive = towupper (favorite.MountPoint[0]) - L'A';
@@ -10882,7 +11250,7 @@ static BOOL MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, 
 		{
 			SystemFavoritesServiceLogError (wstring (L"The drive letter ") + (wchar_t) (drive + L'A') + wstring (L" used by favorite \"") + favorite.Path + L"\" is invalid.\nThis system favorite will not be mounted");
 		}
-		return FALSE;
+		return MountResultFailed;
 	}
 
 	mountOptions.ReadOnly = favorite.ReadOnly || userForcedReadOnly;
@@ -10948,7 +11316,7 @@ static BOOL MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, 
 			mountOptions.ProtectedHidVolPim = CmdVolumePim;
 			if (Silent || (SecureDesktopDialogBoxParam (hInst, MAKEINTRESOURCEW (IDD_MOUNT_OPTIONS), hwnd, (DLGPROC) MountOptionsDlgProc, (LPARAM) &mountOptions) == IDCANCEL))
 			{
-				status = FALSE;
+				result = MountResultFailed;
 				goto skipMount;
 			}
 		}
@@ -10958,7 +11326,7 @@ static BOOL MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, 
 		if (ServiceMode)
 			SystemFavoritesServiceLogInfo (wstring (L"Mounting system favorite \"") + effectiveVolumePath + L"\"");
 
-		status = Mount (hwnd, drive, (wchar_t *) effectiveVolumePath.c_str(), favorite.Pim, favorite.Pkcs5);
+		result = Mount (hwnd, drive, (wchar_t *) effectiveVolumePath.c_str(), favorite.Pim, favorite.Pkcs5, pMountBatch);
 
 		if (ServiceMode)
 		{
@@ -10966,7 +11334,7 @@ static BOOL MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, 
 			SystemFavoritesServiceStatus.dwCheckPoint++;
 			SystemFavoritesServiceSetStatus (SERVICE_START_PENDING, 120000);
 
-			if (status)
+			if (result == MountResultSucceeded)
 			{
 				SystemFavoritesServiceLogInfo (wstring (L"Favorite \"") + effectiveVolumePath + wstring (L"\" mounted successfully as ") + (wchar_t) (drive + L'A') + L":");
 			}
@@ -10976,7 +11344,7 @@ static BOOL MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, 
 			}
 		}
 
-		if (status && mountOptions.ReadOnly != prevReadOnly)
+		if (result == MountResultSucceeded && mountOptions.ReadOnly != prevReadOnly)
 			userForcedReadOnly = mountOptions.ReadOnly;
 
 skipMount:
@@ -10984,7 +11352,7 @@ skipMount:
 
 		if (systemFavorites && prevVolumeAtMountPoint[0])
 		{
-			if (status)
+			if (result == MountResultSucceeded)
 			{
 				int freeDrive = GetFirstAvailableDrive();
 				if (freeDrive != -1)
@@ -11010,21 +11378,73 @@ skipMount:
 		}
 	}
 	else if (!systemFavorites && !favoriteVolumeToMount.Path.empty())
+	{
 		Error ("DRIVE_LETTER_UNAVAILABLE", MainDlg);
+		result = MountResultDriveLetterUnavailable;
+	}
 	else if (ServiceMode && systemFavorites)
 	{
 		SystemFavoritesServiceLogError (wstring (L"The drive letter ") + (wchar_t) (drive + L'A') + wstring (L" used by favorite \"") + effectiveVolumePath + L"\" is already taken.\nThis system favorite will not be mounted");
 	}
 
-	return status;
+	if (result == MountResultCancelled)
+		SetLastError (ERROR_CANCELLED);
+
+	return result;
 }
 
 
-BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOOL hotKeyMount, const FavoriteVolume &favoriteVolumeToMount)
+/* Applies a single favorite's mount result to the running batch state. Returns FALSE
+   if the batch must stop after this favorite. pResult must be valid. */
+static BOOL HandleFavoriteMountResult (MountResult mountResult, MountBatchContext* pMountBatch, MountFavoriteVolumesResult* pResult)
 {
-	BOOL bRet = TRUE, status = TRUE;
+	switch (mountResult)
+	{
+	case MountResultSucceeded:
+		pResult->MountedAny = TRUE;
+		return TRUE;
+
+	case MountResultFailed:
+		pResult->Success = FALSE;
+		return TRUE;
+
+	case MountResultCancelled:
+		/* Wait-dialog/driver abort: stop the whole batch. */
+		MountBatchRequestAbort (pMountBatch);
+		pResult->StopReason = mountResult;
+		pResult->Success = FALSE;
+		return FALSE;
+
+	case MountResultArrivalPasswordPromptDeclined:
+		/* Arrival password-prompt cancel suppresses this favorite without aborting the batch. */
+		pResult->StopReason = mountResult;
+		pResult->Success = FALSE;
+		return FALSE;
+
+	case MountResultDriveLetterUnavailable:
+		/* The favorite's drive letter is taken by another volume. Treat this as a non-fatal
+		   skip (it does not flip overall success to failure): the favorite-on-arrival scan
+		   relies on this so it parks the favorite instead of re-prompting and re-showing the
+		   error on every timer tick. */
+		return TRUE;
+
+	case MountResultSkipped:
+	default:
+		return TRUE;
+	}
+}
+
+
+static MountFavoriteVolumesResult MountFavoriteVolumesWithAbort (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOOL hotKeyMount, const FavoriteVolume &favoriteVolumeToMount, MountBatchContext* pMountBatch)
+{
+	MountFavoriteVolumesResult batchResult;
+	MountResult mountResult = MountResultSkipped;
 	BOOL lastbExplore;
 	BOOL userForcedReadOnly = FALSE;
+
+	batchResult.Success = TRUE;
+	batchResult.MountedAny = FALSE;
+	batchResult.StopReason = MountResultSucceeded;
 
 	if (ServiceMode)
 	{
@@ -11080,7 +11500,8 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 		{
 			if (ServiceMode)
 				SystemFavoritesServiceLogError (wstring (L"An error occured while reading System Favorites XML file"));
-			return false;
+			batchResult.Success = FALSE;
+			goto ret;
 		}
 	}
 	else if (!favoriteVolumeToMount.Path.empty())
@@ -11090,6 +11511,13 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 
 	for (const FavoriteVolume& favorite: favorites)
 	{
+		if (MountBatchAbortRequested (pMountBatch))
+		{
+			batchResult.StopReason = MountResultCancelled;
+			batchResult.Success = FALSE;
+			goto ret;
+		}
+
 		if (ServiceMode && systemFavorites && favorite.DisconnectedDevice)
 		{
 			skippedSystemFavorites.push_back (favorite);
@@ -11106,9 +11534,10 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 			continue;
 		}
 
-		status = MountFavoriteVolumeBase (hwnd, favorite, lastbExplore, userForcedReadOnly, systemFavorites, logOnMount, hotKeyMount, favoriteVolumeToMount);
-		if (!status)
-			bRet = FALSE;
+		SetLastError (ERROR_SUCCESS);
+		mountResult = MountFavoriteVolumeBase (hwnd, favorite, lastbExplore, userForcedReadOnly, systemFavorites, logOnMount, hotKeyMount, favoriteVolumeToMount, pMountBatch);
+		if (!HandleFavoriteMountResult (mountResult, pMountBatch, &batchResult))
+			goto ret;
 	}
 
 	if (systemFavorites && ServiceMode && !skippedSystemFavorites.empty())
@@ -11119,7 +11548,21 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 		size_t remainingFavorites = skippedSystemFavorites.size();
 		while ((remainingFavorites > 0) && (retryCounter++ < 4))
 		{
+			if (MountBatchAbortRequested (pMountBatch))
+			{
+				batchResult.StopReason = MountResultCancelled;
+				batchResult.Success = FALSE;
+				goto ret;
+			}
+
 			Sleep (5000);
+
+			if (MountBatchAbortRequested (pMountBatch))
+			{
+				batchResult.StopReason = MountResultCancelled;
+				batchResult.Success = FALSE;
+				goto ret;
+			}
 
 			SystemFavoritesServiceLogInfo (wstring (L"Trying to mount skipped system favorites"));
 
@@ -11130,6 +11573,13 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 			for (vector <FavoriteVolume>::iterator favorite = skippedSystemFavorites.begin();
 					favorite != skippedSystemFavorites.end(); favorite++)
 			{
+				if (MountBatchAbortRequested (pMountBatch))
+				{
+					batchResult.StopReason = MountResultCancelled;
+					batchResult.Success = FALSE;
+					goto ret;
+				}
+
 				if (favorite->DisconnectedDevice)
 				{
 					// check if the favorite is here and get its path
@@ -11154,9 +11604,10 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 						else
 							SystemFavoritesServiceLogInfo (wstring (L"Favorite \"") + favorite->VolumePathId + L"\" is connected. Performing mount.");
 
-						status = MountFavoriteVolumeBase (hwnd, *favorite, lastbExplore, userForcedReadOnly, systemFavorites, logOnMount, hotKeyMount, favoriteVolumeToMount);
-						if (!status)
-							bRet = FALSE;
+						SetLastError (ERROR_SUCCESS);
+						mountResult = MountFavoriteVolumeBase (hwnd, *favorite, lastbExplore, userForcedReadOnly, systemFavorites, logOnMount, hotKeyMount, favoriteVolumeToMount, pMountBatch);
+						if (!HandleFavoriteMountResult (mountResult, pMountBatch, &batchResult))
+							goto ret;
 					}
 				}
 			}
@@ -11172,39 +11623,61 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 		}
 	}
 
+ret:
+	if (MountBatchAbortRequested (pMountBatch))
+	{
+		batchResult.StopReason = MountResultCancelled;
+		batchResult.Success = FALSE;
+	}
+
 	MultipleMountOperationInProgress = FALSE;
 	burn (&VolumePassword, sizeof (VolumePassword));
 	burn (&VolumePkcs5, sizeof (VolumePkcs5));
 	burn (&VolumePim, sizeof (VolumePim));
 
-	if (bRet && CloseSecurityTokenSessionsAfterMount)
+	if ((batchResult.Success || ((batchResult.StopReason == MountResultCancelled || batchResult.StopReason == MountResultArrivalPasswordPromptDeclined) && batchResult.MountedAny)) && CloseSecurityTokenSessionsAfterMount)
 		SecurityToken::CloseAllSessions();  // TODO Use Token
 
-	return bRet;
+	if (batchResult.StopReason == MountResultCancelled)
+		SetLastError (ERROR_CANCELLED);
+
+	return batchResult;
 }
 
-void CALLBACK mountFavoriteVolumeCallbackFunction (void *pArg, HWND hwnd)
+BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOOL hotKeyMount, const FavoriteVolume &favoriteVolumeToMount)
+{
+	MountBatchContext mountBatch;
+	MountBatchInitialize (&mountBatch);
+
+	return MountFavoriteVolumesWithAbort (hwnd, systemFavorites, logOnMount, hotKeyMount, favoriteVolumeToMount, &mountBatch).Success;
+}
+
+static void CALLBACK mountFavoriteVolumeCallbackFunction (void *pArg, HWND hwnd)
 {
 	mountFavoriteVolumeThreadParam* pParam = (mountFavoriteVolumeThreadParam*) pArg;
 
-	if (pParam)
-	{
-		finally_do_arg (mountFavoriteVolumeThreadParam*, pParam, { FreeMountFavoriteVolumeThreadParam (finally_arg); });
+	// pArg is always the thread parameter allocated by the caller before _beginthread.
+	if (!pParam)
+		return;
 
-		if (pParam->favoriteVolumeToMount)
-			MountFavoriteVolumes (hwnd, pParam->systemFavorites, pParam->logOnMount, pParam->hotKeyMount, *(pParam->favoriteVolumeToMount));
-		else
-			MountFavoriteVolumes (hwnd, pParam->systemFavorites, pParam->logOnMount, pParam->hotKeyMount);
-	}
-	else
-		MountFavoriteVolumes (hwnd);
+	const FavoriteVolume& favoriteVolumeToMount = pParam->favoriteVolumeToMount ? *(pParam->favoriteVolumeToMount) : FavoriteVolume();
+	MountFavoriteVolumesWithAbort (hwnd, pParam->systemFavorites, pParam->logOnMount, pParam->hotKeyMount, favoriteVolumeToMount, &pParam->mountBatch);
 }
 
-void __cdecl mountFavoriteVolumeThreadFunction (void *pArg)
+BOOL CALLBACK mountFavoriteVolumeCancelProc(void* pArg, HWND )
+{
+	mountFavoriteVolumeThreadParam* threadParam = (mountFavoriteVolumeThreadParam*) pArg;
+
+	return MountBatchCancel (threadParam ? &threadParam->mountBatch : NULL);
+}
+
+static void __cdecl mountFavoriteVolumeThreadFunction (void *pArg)
 {
 	ScreenCaptureBlocker screenCaptureBlocker;
+	mountFavoriteVolumeThreadParam* pParam = (mountFavoriteVolumeThreadParam*) pArg;
 	finally_do ({ _InterlockedExchange(&FavoriteMountOnGoing, 0); });
-	ShowWaitDialog (MainDlg, FALSE, mountFavoriteVolumeCallbackFunction, pArg);
+	finally_do_arg (mountFavoriteVolumeThreadParam*, pParam, { FreeMountFavoriteVolumeThreadParam (finally_arg); });
+	ShowWaitDialogEx (MainDlg, FALSE, mountFavoriteVolumeCallbackFunction, mountFavoriteVolumeCancelProc, pParam);
 }
 
 static void SaveDefaultKeyFilesParam (HWND hwnd)
