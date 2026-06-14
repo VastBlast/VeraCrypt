@@ -610,7 +610,6 @@
     <entry lang="he" key="IDD_PCDM_ADD_REMOVE_VOL_KEYFILES">הוסף / הסר קובצי מפתח אל / מתוך אמצעי האחסון</entry>
     <entry lang="he" key="IDD_PCDM_REMOVE_ALL_KEYFILES_FROM_VOL">הסר את כל הגלישים מהאמצעי אחסון</entry>
     <entry lang="he" key="PASSWORD_CHANGED">סיסמה, PIM ו / או קובץ מפתח הוחלפו בהצלחה. \n \n חשוב: אנא ודא שקראת את החלק &amp;apos;שינוי סיסמאות וקבצי מפתח&amp;apos; בפרק &amp;apos;דרישות אמצעי זהירות&amp;apos; במדריך למשתמש של VeraCrypt.</entry>
-    <entry lang="he" key="FAVORITE_PIM_CHANGED">אמצעי אחסון זה רשום כמועדף על המערכת וה- PIM שלו השתנה. \n האם ברצונך ש- VeraCrypt יתעדכן אוטומטית את תצורת המערכת המועדפת (נדרשות הרשאות מנהל)? \n \n שים לב שאם תענה לא, יהיה עליך לעדכן אתמועדף על המערכת באופן ידני.</entry>
     <entry lang="he" key="SYS_PASSWORD_CHANGED_ASK_RESCUE_DISK">חשוב: אם לא הרסת את דיסק ההצלה של VeraCrypt, ניתן עדיין לפענח את מחיצת המערכת / כונן המערכת באמצעות הסיסמה הישנה (על ידי אתחול דיסק ההצלה של VeraCrypt והזנת הסיסמה הישנה).עליכם ליצור דיסק הצלה חדש של VeraCrypt ואז להרוס את הישן. \n \n האם ברצונכם ליצור דיסק הצלה חדש של VeraCrypt?</entry>
     <entry lang="he" key="SYS_HKD_ALGO_CHANGED_ASK_RESCUE_DISK">שים לב שדיסק ההצלה של VeraCrypt שלך עדיין משתמש באלגוריתם הקודם.אם אתה מחשיב את האלגוריתם הקודם כלא מאובטח, עליך ליצור דיסק הצלה חדש של VeraCrypt ואז להשמיד את הישן. \n \n האם ברצונך ליצור דיסק הצלה חדש של VeraCrypt?</entry>
     <entry lang="he" key="KEYFILES_NOTE">שים לב ש- VeraCrypt לעולם לא משנה את תוכן קובץ המפתחות.אתה יכול לבחור יותר מקובץ מפתח אחד (הסדר לא משנה).אם תוסיף תיקיה, כל הקבצים שאינם מוסתרים שנמצאו בה ישמשו כקובצי מפתח.לחץ על &amp;apos;הוסף קבצי אמצעי אבטחה&amp;apos; כדי לבחור קובצי מפתח המאוחסנים באמצעי האבטחה או בכרטיסים חכמים (או לייבוא קובצי אמצעי אבטחה לאמצעי האבטחה או כרטיסי חכם).</entry>
@@ -1684,6 +1683,8 @@
     <entry lang="en" key="MACOSX_APFS_SYSTEM_STORE">The selected APFS physical store '{0}' contains the currently mounted macOS system volume and cannot be used as a VeraCrypt volume host.</entry>
     <entry lang="en" key="MACOSX_DEVICE_NOT_WRITABLE">macOS reports the selected device '{0}' as read-only. Select a writable physical partition or disk.</entry>
     <entry lang="en" key="MACOSX_APFS_EROFS_HINT">macOS reported the selected device as read-only. If this is an APFS disk, make sure you selected the physical APFS store partition, not an APFS synthesized volume. Use Disk Utility or 'diskutil list' to identify the physical partition, then retry.</entry>
+    <entry lang="en" key="FAVORITE_PIM_OR_KDF_CHANGED">This volume is registered as a System Favorite and its PIM and/or KDF settings were changed.\nDo you want VeraCrypt to automatically update the System Favorite configuration (administrator privileges required)?\n\nPlease note that if you answer no, you'll have to update the System Favorite manually.</entry>
+    <entry lang="en" key="PIM_RESET_ON_KDF_CHANGE_CONFIRM">The selected KDF uses different PIM parameters, so VeraCrypt will not reuse the current custom PIM. The new volume header will use the default PIM for the selected KDF unless you select "Use PIM" in the New section and enter a custom value.\n\nDo you want to continue?</entry>
   </localization>
   <xs:schema attributeFormDefault="unqualified" elementFormDefault="qualified">
     <xs:element name="VeraCrypt">

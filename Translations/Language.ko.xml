@@ -610,7 +610,6 @@
     <entry lang="ko" key="IDD_PCDM_ADD_REMOVE_VOL_KEYFILES">볼륨에서 키파일 추가/제거</entry>
     <entry lang="ko" key="IDD_PCDM_REMOVE_ALL_KEYFILES_FROM_VOL">볼륨에서 모든 키 파일 제거</entry>
     <entry lang="ko" key="PASSWORD_CHANGED">비밀번호, PIM 및/또는 키 파일이 성공적으로 변경되었습니다.\n\n중요: VeraCrypt 사용 설명서의 '보안 요구 사항 및 주의 사항'장의 '비밀번호 및 키 파일 변경'섹션을 읽었는지 확인하세요.</entry>
-    <entry lang="ko" key="FAVORITE_PIM_CHANGED">이 볼륨은 시스템 즐겨찾기로 등록되어 PIM이 변경되었습니다.\nVeraCrypt가 시스템 즐겨찾기 구성을 자동으로 업데이트하도록 할까요? (관리자 권한 필요)\n\n아니오라고 대답할 경우 시스템 즐겨찾기를 수동으로 업데이트해야 합니다.</entry>
     <entry lang="ko" key="SYS_PASSWORD_CHANGED_ASK_RESCUE_DISK">중요: VeraCrypt 응급 복구 디스크를 폐기하지 않은 경우 이전 암호를 사용하여 시스템 파티션/드라이브를 해독 할 수 있습니다(VeraCrypt 응급 복구 디스크를 부팅하고 이전 암호 입력). 새로운 VeraCrypt 응급 복구 디스크를 작성한 다음 이전 버전을 폐기해야합니다.\n\n새로운 VeraCrypt 응급 복구 디스크를 만드시겠습니까?</entry>
     <entry lang="ko" key="SYS_HKD_ALGO_CHANGED_ASK_RESCUE_DISK">VeraCrypt 응급 복구 디스크는 여전히 이전 알고리즘을 사용합니다. 이전의 알고리즘이 안전하지 않다고 생각하면 새로운 VeraCrypt 응급 복구 디스크를 생성 한 다음 이전 VeraCrypt 응급 복구 디스크를 폐기해야합니다.\n\n새로운 VeraCrypt 응급 복구 디스크를 만드시겠습니까?</entry>
     <entry lang="ko" key="KEYFILES_NOTE">VeraCrypt는 키 파일 내용을 수정하지 않습니다. 둘 이상의 키 파일을 선택할 수 있습니다(순서는 중요하지 않음). 폴더를 추가하면 그 안에있는 숨겨진 파일이 아닌 모든 키 파일이 키 파일로 사용됩니다. '토큰 파일 추가'를 클릭하여 보안 토큰 또는 스마트 카드에 저장된 키 파일을 선택하거나 키 파일을 보안 토큰 또는 스마트 카드로 가져옵니다.</entry>
@@ -1684,6 +1683,8 @@
     <entry lang="ko" key="MACOSX_APFS_SYSTEM_STORE">선택한 APFS 물리적 저장소 '{0}'에는 현재 마운트된 macOS 시스템 볼륨이 포함되어 있으므로 VeraCrypt 볼륨 호스트로 사용할 수 없습니다.</entry>
     <entry lang="ko" key="MACOSX_DEVICE_NOT_WRITABLE">macOS에서 선택한 장치 '{0}'을 읽기 전용으로 보고했습니다. 쓰기 가능한 물리적 파티션 또는 디스크를 선택하세요.</entry>
     <entry lang="ko" key="MACOSX_APFS_EROFS_HINT">macOS에서 선택한 장치를 읽기 전용으로 보고했습니다. APFS 디스크인 경우 APFS 합성 볼륨이 아니라 물리적 APFS 저장소 파티션을 선택했는지 확인하세요. 디스크 유틸리티 또는 'diskutil list'를 사용하여 물리적 파티션을 식별한 다음 다시 시도하세요.</entry>
+    <entry lang="en" key="FAVORITE_PIM_OR_KDF_CHANGED">This volume is registered as a System Favorite and its PIM and/or KDF settings were changed.\nDo you want VeraCrypt to automatically update the System Favorite configuration (administrator privileges required)?\n\nPlease note that if you answer no, you'll have to update the System Favorite manually.</entry>
+    <entry lang="en" key="PIM_RESET_ON_KDF_CHANGE_CONFIRM">The selected KDF uses different PIM parameters, so VeraCrypt will not reuse the current custom PIM. The new volume header will use the default PIM for the selected KDF unless you select "Use PIM" in the New section and enter a custom value.\n\nDo you want to continue?</entry>
   </localization>
   <xs:schema attributeFormDefault="unqualified" elementFormDefault="qualified" xmlns:xs="http://www.w3.org/2001/XMLSchema">
     <xs:element name="VeraCrypt">
