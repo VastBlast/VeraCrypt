@@ -57,6 +57,83 @@ namespace VeraCrypt
 	// closing it can hang up the service controlling terminal.
 	static int DoasAuthTerminalFd = -1;
 
+	static void SetCloseOnExec (int fd, bool closeOnExec)
+	{
+		int flags = fcntl (fd, F_GETFD, 0);
+		throw_sys_if (flags == -1);
+
+		int newFlags = closeOnExec ? (flags | FD_CLOEXEC) : (flags & ~FD_CLOEXEC);
+		if (newFlags != flags)
+			throw_sys_if (fcntl (fd, F_SETFD, newFlags) == -1);
+	}
+
+	static void SetPipeCloseOnExec (Pipe &pipe)
+	{
+		SetCloseOnExec (pipe.PeekReadFD(), true);
+		SetCloseOnExec (pipe.PeekWriteFD(), true);
+	}
+
+	static bool IsStandardFd (int fd)
+	{
+		return fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO;
+	}
+
+	static int DuplicateCloseOnExec (int fd)
+	{
+		int duplicateFd;
+#ifdef F_DUPFD_CLOEXEC
+		duplicateFd = fcntl (fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+		if (duplicateFd != -1)
+			return duplicateFd;
+
+		if (errno != EINVAL)
+			throw SystemException (SRC_POS);
+#endif
+		duplicateFd = fcntl (fd, F_DUPFD, STDERR_FILENO + 1);
+		throw_sys_if (duplicateFd == -1);
+
+		try
+		{
+			SetCloseOnExec (duplicateFd, true);
+		}
+		catch (...)
+		{
+			close (duplicateFd);
+			throw;
+		}
+
+		return duplicateFd;
+	}
+
+	static void MoveFdAwayFromStandardFdsIfNeeded (int &fd)
+	{
+		if (fd != -1 && IsStandardFd (fd))
+			fd = DuplicateCloseOnExec (fd);
+	}
+
+	static void MoveFdAwayFromStandardFdIfNeeded (int &fd, int standardFd)
+	{
+		if (fd != standardFd)
+			MoveFdAwayFromStandardFdsIfNeeded (fd);
+	}
+
+	static void PrepareStandardFdMapping (int &stdinFd, int &stdoutFd, int &stderrFd)
+	{
+		MoveFdAwayFromStandardFdIfNeeded (stdinFd, STDIN_FILENO);
+		MoveFdAwayFromStandardFdIfNeeded (stdoutFd, STDOUT_FILENO);
+		MoveFdAwayFromStandardFdIfNeeded (stderrFd, STDERR_FILENO);
+	}
+
+	static void DupToStandardFd (int fd, int standardFd)
+	{
+		if (fd != standardFd)
+			throw_sys_if (dup2 (fd, standardFd) == -1);
+
+		// If fd already equals standardFd, dup2() is a no-op and does not clear
+		// FD_CLOEXEC. Clear it explicitly for all descriptors kept across exec.
+		SetCloseOnExec (standardFd, false);
+	}
+
 	static void RedirectStandardErrorToDevNull ()
 	{
 		int f = open ("/dev/null", O_WRONLY);
@@ -119,13 +196,27 @@ namespace VeraCrypt
 	static int OpenDoasAuthTerminal (string &slavePath)
 	{
 #ifdef O_CLOEXEC
+		bool fdCloseOnExec = true;
 		int fd = posix_openpt (O_RDWR | O_NOCTTY | O_CLOEXEC);
+		if (fd == -1 && errno == EINVAL)
+		{
+			// Some systems, including OpenBSD, only accept the POSIX
+			// pseudoterminal flags here. Set close-on-exec below instead.
+			fdCloseOnExec = false;
+			fd = posix_openpt (O_RDWR | O_NOCTTY);
+		}
 #else
 		int fd = posix_openpt (O_RDWR | O_NOCTTY);
 #endif
 		throw_sys_sub_if (fd == -1, "posix_openpt");
 
-#ifndef O_CLOEXEC
+#ifdef O_CLOEXEC
+		if (!fdCloseOnExec && fcntl (fd, F_SETFD, FD_CLOEXEC) == -1)
+		{
+			close (fd);
+			throw SystemException (SRC_POS);
+		}
+#else
 		if (fcntl (fd, F_SETFD, FD_CLOEXEC) == -1)
 		{
 			close (fd);
@@ -171,7 +262,7 @@ namespace VeraCrypt
 		}
 	}
 
-	static void AttachDoasAuthTerminal (const string &slavePath)
+	static void AttachDoasAuthTerminal (const string &slavePath, bool keepStderrOnTerminal)
 	{
 		throw_sys_if (setsid () == -1);
 #ifdef O_CLOEXEC
@@ -213,7 +304,34 @@ namespace VeraCrypt
 			throw SystemException (SRC_POS, "Failed to set doas authentication terminal as controlling terminal");
 		}
 #endif
-		close (ttyFd);
+#ifdef TC_OPENBSD
+		if (tcsetpgrp (ttyFd, getpgrp()) == -1)
+		{
+			int err = errno;
+			close (ttyFd);
+			errno = err;
+			throw SystemException (SRC_POS, "Failed to set doas authentication terminal foreground process group");
+		}
+#else
+		tcsetpgrp (ttyFd, getpgrp());
+#endif
+		bool ttyFdKeptOnStderr = keepStderrOnTerminal && ttyFd == STDERR_FILENO;
+		if (keepStderrOnTerminal)
+		{
+			try
+			{
+				DupToStandardFd (ttyFd, STDERR_FILENO);
+			}
+			catch (...)
+			{
+				if (!ttyFdKeptOnStderr)
+					close (ttyFd);
+				throw;
+			}
+		}
+
+		if (!ttyFdKeptOnStderr)
+			close (ttyFd);
 	}
 
 	static void ReapChildProcessAsync (int pid)
@@ -294,6 +412,115 @@ namespace VeraCrypt
 		return string (errOutput.begin(), errOutput.end());
 	}
 
+	static string NormalizeTerminalOutput (const string &terminalOutput)
+	{
+		string normalized;
+		bool previousNewline = false;
+
+		for (size_t i = 0; i < terminalOutput.size(); ++i)
+		{
+			char c = terminalOutput[i];
+			if (c == '\r')
+			{
+				if (i + 1 < terminalOutput.size() && terminalOutput[i + 1] == '\n')
+					continue;
+				c = '\n';
+			}
+
+			if (c == '\n')
+			{
+				if (previousNewline)
+					continue;
+				previousNewline = true;
+			}
+			else
+				previousNewline = false;
+
+			normalized += c;
+		}
+
+		while (!normalized.empty() && normalized[0] == '\n')
+			normalized.erase (0, 1);
+		while (!normalized.empty() && normalized[normalized.size() - 1] == '\n')
+			normalized.erase (normalized.size() - 1);
+
+		return normalized;
+	}
+
+	static bool StringEndsWith (const string &str, const string &suffix)
+	{
+		return str.size() >= suffix.size() && str.compare (str.size() - suffix.size(), suffix.size(), suffix) == 0;
+	}
+
+	static string TrimTerminalLine (const string &line)
+	{
+		size_t first = line.find_first_not_of (" \t");
+		if (first == string::npos)
+			return string();
+
+		size_t last = line.find_last_not_of (" \t");
+		return line.substr (first, last - first + 1);
+	}
+
+	static bool IsDoasPasswordPromptLine (const string &line)
+	{
+		string trimmed = TrimTerminalLine (line);
+		return trimmed.find ("doas (") == 0 && StringEndsWith (trimmed, " password:");
+	}
+
+	static string NormalizeDoasAuthTerminalOutput (const string &terminalOutput)
+	{
+		string normalized = NormalizeTerminalOutput (terminalOutput);
+		string filtered;
+		size_t lineStart = 0;
+
+		while (lineStart <= normalized.size())
+		{
+			size_t lineEnd = normalized.find ('\n', lineStart);
+			string line = lineEnd == string::npos ? normalized.substr (lineStart) : normalized.substr (lineStart, lineEnd - lineStart);
+
+			if (!IsDoasPasswordPromptLine (line))
+			{
+				if (!filtered.empty())
+					filtered += '\n';
+				filtered += line;
+			}
+
+			if (lineEnd == string::npos)
+				break;
+
+			lineStart = lineEnd + 1;
+		}
+
+		return NormalizeTerminalOutput (filtered);
+	}
+
+	static bool DoasAuthenticationFailed (const vector <char> &authOutput)
+	{
+		return ErrorOutputToString (authOutput).find ("doas: Authentication failed") != string::npos;
+	}
+
+	static string CombineElevationErrorOutput (const vector <char> &errOutput, const vector <char> &authOutput)
+	{
+		string output = ErrorOutputToString (errOutput);
+		string authText = NormalizeDoasAuthTerminalOutput (ErrorOutputToString (authOutput));
+
+		if (!authText.empty())
+		{
+			if (!output.empty() && output[output.size() - 1] != '\n')
+				output += "\n";
+			output += authText;
+		}
+
+		return output;
+	}
+
+	static void ReadAvailableDataIfAny (int fd, vector <char> &output)
+	{
+		if (fd != -1)
+			ReadAvailableData (fd, output);
+	}
+
 	static void ThrowSerializedExceptionIfAny (const vector <char> &errOutput)
 	{
 		if (errOutput.empty())
@@ -314,8 +541,10 @@ namespace VeraCrypt
 			deserializedException->Throw();
 	}
 
-	static void WriteAllBestEffort (int fd, const char *data, size_t size)
+	static void WriteAllBestEffort (int fd, const char *data, size_t size, int retryTimeout = 0)
 	{
+		const int retryDelay = 50;
+		int retryTimeLeft = retryTimeout;
 		size_t offset = 0;
 		while (offset < size)
 		{
@@ -329,11 +558,103 @@ namespace VeraCrypt
 			if (bytesWritten == -1 && errno == EINTR)
 				continue;
 
+			if (bytesWritten == -1 && retryTimeLeft > 0 && (errno == EIO || errno == EAGAIN || errno == EWOULDBLOCK))
+			{
+				Thread::Sleep (retryDelay);
+				retryTimeLeft -= retryDelay;
+				continue;
+			}
+
 			return;
 		}
 	}
 
-	static void SendElevatedServiceSyncWithTimeout (shared_ptr <Stream> inputStream, int outputFd, int errorFd, int childPid, const string &helperName, int timeout)
+#ifdef TC_OPENBSD
+	static bool ReadDoasAuthTerminalPromptData (int fd, vector <char> &authOutput)
+	{
+		char buffer[256];
+		bool dataRead = false;
+
+		while (true)
+		{
+			ssize_t bytesRead = read (fd, buffer, sizeof (buffer));
+			if (bytesRead > 0)
+			{
+				authOutput.insert (authOutput.end(), buffer, buffer + bytesRead);
+				dataRead = true;
+				continue;
+			}
+
+			if (bytesRead == -1 && errno == EINTR)
+				continue;
+
+			if (bytesRead == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+				return dataRead;
+
+			return dataRead;
+		}
+	}
+
+	static bool WaitForDoasAuthTerminalPrompt (int fd, vector <char> &authOutput, int timeout)
+	{
+		const int pollInterval = 50;
+		int timeLeft = timeout;
+		int terminalFlags = fcntl (fd, F_GETFL, 0);
+		if (terminalFlags == -1)
+			return false;
+
+		bool restoreFlags = (terminalFlags & O_NONBLOCK) == 0;
+		if (restoreFlags && fcntl (fd, F_SETFL, terminalFlags | O_NONBLOCK) == -1)
+			return false;
+
+		while (timeLeft > 0)
+		{
+			struct pollfd pfd;
+			memset (&pfd, 0, sizeof (pfd));
+			pfd.fd = fd;
+			pfd.events = POLLIN;
+
+			int pollTimeout = timeLeft < pollInterval ? timeLeft : pollInterval;
+			int pollResult;
+			do
+			{
+				pollResult = poll (&pfd, 1, pollTimeout);
+			} while (pollResult == -1 && errno == EINTR);
+
+			if (pollResult == -1)
+				break;
+
+			if (pollResult == 0)
+			{
+				timeLeft -= pollTimeout;
+				continue;
+			}
+
+			if ((pfd.revents & POLLIN) && ReadDoasAuthTerminalPromptData (fd, authOutput))
+			{
+				if (restoreFlags)
+					fcntl (fd, F_SETFL, terminalFlags);
+				return true;
+			}
+
+			if (pfd.revents & (POLLERR | POLLNVAL))
+				break;
+
+			// On OpenBSD a PTY master reports POLLIN|POLLHUP before the
+			// slave is opened. A zero-byte read distinguishes that state from
+			// the real doas prompt; wait real time instead of spinning.
+			Thread::Sleep (pollTimeout);
+			timeLeft -= pollTimeout;
+		}
+
+		if (restoreFlags)
+			fcntl (fd, F_SETFL, terminalFlags);
+
+		return false;
+	}
+#endif
+
+	static void SendElevatedServiceSyncWithTimeout (shared_ptr <Stream> inputStream, int outputFd, int errorFd, int authFd, vector <char> authOutput, int childPid, const string &helperName, int timeout)
 	{
 		vector <char> errOutput;
 		uint8 sync[] = { 0, 0x11, 0x22 };
@@ -344,35 +665,71 @@ namespace VeraCrypt
 		}
 		catch (...)
 		{
-			ReadAvailableData (errorFd, errOutput);
+			ReadAvailableDataIfAny (errorFd, errOutput);
+			ReadAvailableDataIfAny (authFd, authOutput);
 			TerminateChildProcessAsync (childPid);
 			ThrowSerializedExceptionIfAny (errOutput);
-			throw ElevationFailed (SRC_POS, helperName, 1, ErrorOutputToString (errOutput));
+			throw ElevationFailed (SRC_POS, helperName, 1, CombineElevationErrorOutput (errOutput, authOutput));
 		}
 
 		const int pollInterval = 200;
 		int timeLeft = timeout;
+		bool errorFdActive = errorFd != -1;
+		bool authFdActive = authFd != -1;
 		while (timeLeft > 0)
 		{
-			struct pollfd fds[2];
+			struct pollfd fds[3];
 			memset (fds, 0, sizeof (fds));
 			fds[0].fd = outputFd;
 			fds[0].events = POLLIN;
-			fds[1].fd = errorFd;
-			fds[1].events = POLLIN;
+			nfds_t fdCount = 1;
+			nfds_t errorFdIndex = 0;
+			nfds_t authFdIndex = 0;
+			if (errorFdActive)
+			{
+				errorFdIndex = fdCount;
+				fds[fdCount].fd = errorFd;
+				fds[fdCount].events = POLLIN;
+				++fdCount;
+			}
+			if (authFdActive)
+			{
+				authFdIndex = fdCount;
+				fds[fdCount].fd = authFd;
+				fds[fdCount].events = POLLIN;
+				++fdCount;
+			}
 
 			int pollTimeout = timeLeft < pollInterval ? timeLeft : pollInterval;
 			int pollResult;
 			do
 			{
-				pollResult = poll (fds, array_capacity (fds), pollTimeout);
+				pollResult = poll (fds, fdCount, pollTimeout);
 			} while (pollResult == -1 && errno == EINTR);
 
 			throw_sys_if (pollResult == -1);
 			timeLeft -= pollTimeout;
 
-			if (fds[1].revents & (POLLIN | POLLHUP | POLLERR))
+			if (errorFdActive && (fds[errorFdIndex].revents & (POLLIN | POLLHUP | POLLERR)))
+			{
+				size_t previousErrOutputSize = errOutput.size();
 				ReadAvailableData (errorFd, errOutput);
+				if ((fds[errorFdIndex].revents & (POLLHUP | POLLERR)) && errOutput.size() == previousErrOutputSize)
+					errorFdActive = false;
+			}
+			if (authFdActive && (fds[authFdIndex].revents & (POLLIN | POLLHUP | POLLERR)))
+			{
+				size_t previousAuthOutputSize = authOutput.size();
+				ReadAvailableData (authFd, authOutput);
+				if ((fds[authFdIndex].revents & (POLLHUP | POLLERR)) && authOutput.size() == previousAuthOutputSize)
+					authFdActive = false;
+			}
+			if (DoasAuthenticationFailed (authOutput))
+			{
+				TerminateChildProcessAsync (childPid);
+				ThrowSerializedExceptionIfAny (errOutput);
+				throw ElevationFailed (SRC_POS, helperName, 1, CombineElevationErrorOutput (errOutput, authOutput));
+			}
 
 			if (fds[0].revents & POLLIN)
 			{
@@ -388,7 +745,7 @@ namespace VeraCrypt
 
 				TerminateChildProcessAsync (childPid);
 				ThrowSerializedExceptionIfAny (errOutput);
-				throw ElevationFailed (SRC_POS, helperName, 1, ErrorOutputToString (errOutput));
+				throw ElevationFailed (SRC_POS, helperName, 1, CombineElevationErrorOutput (errOutput, authOutput));
 			}
 
 			int status;
@@ -400,10 +757,11 @@ namespace VeraCrypt
 
 			if (waitRes == childPid)
 			{
-				ReadAvailableData (errorFd, errOutput);
+				ReadAvailableDataIfAny (errorFd, errOutput);
+				ReadAvailableDataIfAny (authFd, authOutput);
 				ThrowSerializedExceptionIfAny (errOutput);
 				int exitCode = WIFEXITED (status) ? WEXITSTATUS (status) : 1;
-				throw ElevationFailed (SRC_POS, helperName, exitCode, ErrorOutputToString (errOutput));
+				throw ElevationFailed (SRC_POS, helperName, exitCode, CombineElevationErrorOutput (errOutput, authOutput));
 			}
 
 			throw_sys_if (waitRes == -1);
@@ -412,13 +770,14 @@ namespace VeraCrypt
 			{
 				TerminateChildProcessAsync (childPid);
 				ThrowSerializedExceptionIfAny (errOutput);
-				throw ElevationFailed (SRC_POS, helperName, 1, ErrorOutputToString (errOutput));
+				throw ElevationFailed (SRC_POS, helperName, 1, CombineElevationErrorOutput (errOutput, authOutput));
 			}
 		}
 
-		ReadAvailableData (errorFd, errOutput);
+		ReadAvailableDataIfAny (errorFd, errOutput);
+		ReadAvailableDataIfAny (authFd, authOutput);
 		ThrowSerializedExceptionIfAny (errOutput);
-		string errorOutput = ErrorOutputToString (errOutput);
+		string errorOutput = CombineElevationErrorOutput (errOutput, authOutput);
 		if (errorOutput.empty())
 			errorOutput = "Timed out while waiting for the elevated VeraCrypt service to start";
 
@@ -993,12 +1352,16 @@ namespace VeraCrypt
 		unique_ptr <Pipe> inPipe (new Pipe());
 		unique_ptr <Pipe> outPipe (new Pipe());
 		Pipe errPipe;
+		SetPipeCloseOnExec (*inPipe);
+		SetPipeCloseOnExec (*outPipe);
+		SetPipeCloseOnExec (errPipe);
 
 		int forkedPid = fork();
 		throw_sys_if (forkedPid == -1);
 
 		if (forkedPid == 0)
 		{
+			int childErrorFd = -1;
 			try
 			{
 				try
@@ -1014,27 +1377,49 @@ namespace VeraCrypt
 					}
 
 #if defined(TC_LINUX)
-                    // AppImage specific handling:
-                    // If running from an AppImage, use the path to the AppImage file itself for the privilege helper.
-                    const char* appImageEnv = getenv("APPIMAGE");
+					// AppImage specific handling:
+					// If running from an AppImage, use the path to the AppImage file itself for the privilege helper.
+					const char* appImageEnv = getenv("APPIMAGE");
 
 					if (Process::IsRunningUnderAppImage(appPath) && appImageEnv != NULL)
 					{
 						// The path to the AppImage file is stored in the APPIMAGE environment variable.
 						// We need to use this path for elevation to work correctly.
-                        appPath = appImageEnv;
-                    }
-#endif
-					if (privilegeHelper.IsDoas() && !useCallerDoasTerminal)
-					{
-						AttachDoasAuthTerminal (doasAuthTerminalPath);
+						appPath = appImageEnv;
 					}
-					if (doasAuthTerminal != -1)
+#endif
+					bool useDoasAuthTerminal = privilegeHelper.IsDoas() && !useCallerDoasTerminal;
+#ifdef TC_OPENBSD
+					// OpenBSD doas requires stderr to be a terminal while it
+					// prompts for the password. Keeping the private PTY slave
+					// on stderr satisfies that while stdin/stdout stay as the
+					// service pipes.
+					bool keepDoasStderrOnAuthTerminal = useDoasAuthTerminal;
+#else
+					bool keepDoasStderrOnAuthTerminal = false;
+#endif
+					int childStdinFd = inPipe->GetReadFD();
+					int childStdoutFd = outPipe->GetWriteFD();
+					childErrorFd = errPipe.GetWriteFD();
+						int childStderrFd = keepDoasStderrOnAuthTerminal ? -1 : childErrorFd;
+						PrepareStandardFdMapping (childStdinFd, childStdoutFd, childStderrFd);
+						if (keepDoasStderrOnAuthTerminal)
+							MoveFdAwayFromStandardFdsIfNeeded (childErrorFd);
+						else
+							childErrorFd = childStderrFd;
+
+					if (useDoasAuthTerminal)
+					{
+						AttachDoasAuthTerminal (doasAuthTerminalPath, keepDoasStderrOnAuthTerminal);
+					}
+					bool doasAuthTerminalReplacedByStderr = keepDoasStderrOnAuthTerminal && doasAuthTerminal == STDERR_FILENO;
+					if (doasAuthTerminal != -1 && !doasAuthTerminalReplacedByStderr)
 						close (doasAuthTerminal);
 
-					throw_sys_if (dup2 (errPipe.GetWriteFD(), STDERR_FILENO) == -1);
-					throw_sys_if (dup2 (inPipe->GetReadFD(), STDIN_FILENO) == -1);
-					throw_sys_if (dup2 (outPipe->GetWriteFD(), STDOUT_FILENO) == -1);
+					if (!keepDoasStderrOnAuthTerminal)
+						DupToStandardFd (childStderrFd, STDERR_FILENO);
+					DupToStandardFd (childStdinFd, STDIN_FILENO);
+					DupToStandardFd (childStdoutFd, STDOUT_FILENO);
 
 					const char *sudoArgs[] = { privilegeHelper.Path.c_str(), "-S", "-p", "", appPath.c_str(), TC_CORE_SERVICE_CMDLINE_OPTION, nullptr };
 					const char *doasArgs[] = { privilegeHelper.Path.c_str(), appPath.c_str(), TC_CORE_SERVICE_NO_FORK_CMDLINE_OPTION, nullptr };
@@ -1060,7 +1445,7 @@ namespace VeraCrypt
 			{
 				try
 				{
-					shared_ptr <Stream> outputStream (new FileStream (errPipe.GetWriteFD()));
+					shared_ptr <Stream> outputStream (new FileStream (childErrorFd != -1 ? childErrorFd : errPipe.GetWriteFD()));
 					e.Serialize (outputStream);
 				}
 				catch (...) { }
@@ -1088,6 +1473,7 @@ namespace VeraCrypt
 			Memory::Copy (&adminPassword.front(), request.AdminPassword.c_str(), request.AdminPassword.size());
 			adminPassword[request.AdminPassword.size()] = '\n';
 		}
+		vector <char> authOutput;
 
 #if defined(TC_LINUX )
 		Thread::Sleep (1000); // wait 1 second for the forked privilege helper to start
@@ -1099,7 +1485,12 @@ namespace VeraCrypt
 		else if (doasAuthTerminal != -1 && !doasNoPasswordAttempt)
 		{
 			// doas reads authentication from the controlling terminal, not stdin.
-			WriteAllBestEffort (doasAuthTerminal, &adminPassword.front(), adminPassword.size());
+			bool writeDoasPassword = true;
+#ifdef TC_OPENBSD
+			writeDoasPassword = WaitForDoasAuthTerminalPrompt (doasAuthTerminal, authOutput, timeout);
+#endif
+			if (writeDoasPassword)
+				WriteAllBestEffort (doasAuthTerminal, &adminPassword.front(), adminPassword.size(), 2000);
 		}
 
 		burn (&adminPassword.front(), adminPassword.size());
@@ -1111,8 +1502,19 @@ namespace VeraCrypt
 		{
 			shared_ptr <Stream> inputStream (new FileStream (serviceInputFd));
 			shared_ptr <Stream> outputStream (new FileStream (serviceOutputFd));
+			int authOutputFd = -1;
 
-			SendElevatedServiceSyncWithTimeout (inputStream, serviceOutputFd, errPipe.GetReadFD(), forkedPid, privilegeHelper.Name, timeout);
+#ifdef TC_OPENBSD
+			if (doasAuthTerminal != -1)
+			{
+				int authTerminalFlags = fcntl (doasAuthTerminal, F_GETFL, 0);
+				throw_sys_if (authTerminalFlags == -1);
+				throw_sys_if (fcntl (doasAuthTerminal, F_SETFL, authTerminalFlags | O_NONBLOCK) == -1);
+				authOutputFd = doasAuthTerminal;
+			}
+#endif
+
+			SendElevatedServiceSyncWithTimeout (inputStream, serviceOutputFd, errPipe.GetReadFD(), authOutputFd, authOutput, forkedPid, privilegeHelper.Name, timeout);
 			throw_sys_if (fcntl (serviceOutputFd, F_SETFL, 0) == -1);
 			ReapChildProcessAsync (forkedPid);
 
