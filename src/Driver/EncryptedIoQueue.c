@@ -422,12 +422,6 @@ static VOID CompleteIrpWorkItemRoutine(PDEVICE_OBJECT DeviceObject, PVOID Contex
 	}
 	__finally
 	{
-		// If no active work items remain, signal the event
-		if (InterlockedDecrement(&queue->ActiveWorkItems) == 0)
-		{
-			KeSetEvent(&queue->NoActiveWorkItemsEvent, IO_DISK_INCREMENT, FALSE);
-		}
-
 		// Return the work item to the free list
 		KeAcquireSpinLock(&queue->WorkItemLock, &oldIrql);
 		InsertTailList(&queue->FreeWorkItemsList, &workItem->ListEntry);
@@ -438,6 +432,19 @@ static VOID CompleteIrpWorkItemRoutine(PDEVICE_OBJECT DeviceObject, PVOID Contex
 
 		// Free the item
 		ReleasePoolBuffer(queue, item);
+
+		// Decrement ActiveWorkItems last: once it reaches zero,
+		// EncryptedIoQueueStop frees the work item pool and buffer pools, so
+		// this routine must not touch queue resources afterwards. The
+		// decrement and signal are done under WorkItemLock, which Stop
+		// re-acquires after draining, guaranteeing this routine has left the
+		// protected region before anything is freed.
+		KeAcquireSpinLock(&queue->WorkItemLock, &oldIrql);
+		if (InterlockedDecrement(&queue->ActiveWorkItems) == 0)
+		{
+			KeSetEvent(&queue->NoActiveWorkItemsEvent, IO_DISK_INCREMENT, FALSE);
+		}
+		KeReleaseSpinLock(&queue->WorkItemLock, oldIrql);
 	}
 }
 
@@ -1382,6 +1389,10 @@ retry_preallocated:
 		goto noMemory;
 	}
 
+	// TCalloc does not zero memory: the cleanup at err: scans the whole pool
+	// and frees any non-NULL WorkItem, so all entries must start as NULL
+	RtlZeroMemory(queue->WorkItemPool, workItemPoolSize);
+
 	// Allocate and initialize work items
 	for (i = 0; i < (int) queue->MaxWorkItems; ++i)
 	{
@@ -1504,6 +1515,15 @@ NTSTATUS EncryptedIoQueueStop (EncryptedIoQueue *queue)
 		KeResetEvent(&queue->NoActiveWorkItemsEvent);
 	}
 
+	// The last work item drops ActiveWorkItems to zero while holding
+	// WorkItemLock; acquiring it here ensures that work item has stopped
+	// touching queue resources before they are freed below.
+	{
+		KIRQL oldIrql;
+		KeAcquireSpinLock(&queue->WorkItemLock, &oldIrql);
+		KeReleaseSpinLock(&queue->WorkItemLock, oldIrql);
+	}
+
 	// Free pre-allocated work items
 	for (ULONG i = 0; i < queue->MaxWorkItems; ++i)
 	{
@@ -1514,6 +1534,9 @@ NTSTATUS EncryptedIoQueueStop (EncryptedIoQueue *queue)
 		}
 	}
 	TCfree(queue->WorkItemPool);
+	// Clear the pointer: the boot drive filter reuses this queue struct across
+	// mount cycles, and a failed restart would otherwise free it again at err:
+	queue->WorkItemPool = NULL;
 
 	TCfree (queue->FragmentBufferA);
 	TCfree (queue->FragmentBufferB);
